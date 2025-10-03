@@ -1,0 +1,254 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from sklearn.impute import KNNImputer
+import calendar  # Import calendar for month names
+from tqdm import tqdm  # Import tqdm for progress bars
+
+def create_knn_feature_matrix(data):
+    """
+    Create a feature matrix for KNN imputation based on custom neighbor selection rules.
+
+    Logic behind neighbor selection:
+    - For a given data point (month-station pair), neighbors are selected based on temporal and spatial proximity.
+    - Temporal proximity:
+      1. The previous and next two months in the same year are considered as neighbors.
+         This helps capture seasonal trends and short-term changes.
+      2. The same month from the previous five years and the next five years are included as neighbors.
+         This captures long-term periodicity (e.g., annual cycles).
+    - Spatial proximity:
+      - Not explicitly considered in this implementation, as the focus is on temporal relationships.
+
+    Parameters:
+    - data: DataFrame where rows are months (datetime index) and columns are stations.
+
+    Returns:
+    - feature_matrix: A DataFrame where each row corresponds to one station-month and columns are neighbors.
+    - original_indices: Indices corresponding to the original data points in the feature matrix.
+    """
+    print("Creating KNN feature matrix...")
+    data.index = pd.to_datetime(data.index)  # Ensure the index is a DatetimeIndex for easier manipulation
+    feature_matrix = []  # List to store the feature vectors for each station-month
+    original_indices = []  # List to store the corresponding indices of the original data points
+
+    # Iterate through each month and station in the data
+    for index, row in tqdm(data.iterrows(), total=len(data), desc="Processing months"):
+        for station in data.columns:
+            current_date = index
+            neighbors = []
+
+            # Add the previous and next two months in the same year
+            for offset in [-2, -1, 1, 2]:
+                neighbor_date = current_date + pd.DateOffset(months=offset)
+                if neighbor_date in data.index:
+                    neighbors.append(data.at[neighbor_date, station])
+                else:
+                    neighbors.append(np.nan)  # Use NaN if the neighbor is missing
+
+            # Add the previous and next five years for the same month
+            for year_offset in range(-5, 6):  # -5 to +5 years
+                neighbor_date = current_date + pd.DateOffset(years=year_offset)
+                if neighbor_date in data.index:
+                    neighbors.append(data.at[neighbor_date, station])
+                else:
+                    neighbors.append(np.nan)  # Use NaN if the neighbor is missing
+
+            # Add the original value (current station-month)
+            neighbors.append(data.at[current_date, station])
+
+            # Save the feature vector and original index
+            feature_matrix.append(neighbors)
+            original_indices.append((current_date, station))
+
+    # Return the feature matrix and the corresponding original indices
+    print("KNN feature matrix created.")
+    return pd.DataFrame(feature_matrix), original_indices
+
+def apply_knn_imputer(feature_matrix, n_neighbors=10):
+    """
+    Apply KNN imputer to the feature matrix.
+
+    Logic behind KNN imputation:
+    - KNN (k-nearest neighbors) imputation is a method where the missing value of a data point
+      is estimated based on the values of its k-nearest neighbors.
+    - Neighbors are determined based on similarity in the feature space.
+    - The value is imputed as the mean of the k-nearest neighbors' values.
+
+    Parameters:
+    - feature_matrix: DataFrame where rows are data points and columns are features (neighbors).
+    - n_neighbors: Number of neighbors to use for KNN imputation.
+
+    Returns:
+    - imputed_matrix: The feature matrix with imputed values.
+    """
+    print("Applying KNN imputer...")
+    knn_imputer = KNNImputer(n_neighbors=n_neighbors)  # Instantiate the KNN imputer
+    imputed_matrix = knn_imputer.fit_transform(feature_matrix)  # Perform imputation
+    print("KNN imputation completed.")
+    return imputed_matrix
+
+def reconstruct_imputed_data(imputed_matrix, original_indices, data):
+    """
+    Reconstruct the imputed DataFrame from the imputed feature matrix.
+
+    Parameters:
+    - imputed_matrix: The feature matrix with imputed values.
+    - original_indices: Indices corresponding to the original data points in the feature matrix.
+    - data: The original DataFrame.
+
+    Returns:
+    - imputed_data: DataFrame with imputed values.
+    - imputed_mask: Boolean DataFrame indicating which values were imputed.
+    """
+    print("Reconstructing imputed data...")
+    imputed_data = data.copy()  # Copy the original data
+    imputed_mask = pd.DataFrame(False, index=data.index, columns=data.columns)  # Boolean mask for imputed values
+
+    # Replace missing values in the original data with the imputed values
+    for i, (date, station) in tqdm(enumerate(original_indices), total=len(original_indices), desc="Reconstructing data"):
+        original_value = data.at[date, station]
+        imputed_value = imputed_matrix[i, -1]  # The original value is the last column of the feature matrix
+
+        if pd.isna(original_value):  # Only replace missing values
+            imputed_data.at[date, station] = imputed_value
+            imputed_mask.at[date, station] = True
+
+    print("Reconstruction of imputed data completed.")
+    return imputed_data, imputed_mask
+
+def plot_station_data(original_data, imputed_data, imputed_mask, station_name, output_folder):
+    """
+    Generate a time series plot for a specific station, distinguishing observed and imputed values.
+
+    Parameters:
+    - original_data: DataFrame of original data.
+    - imputed_data: DataFrame of imputed data.
+    - imputed_mask: Boolean DataFrame indicating which values were imputed.
+    - station_name: Name of the station to plot.
+    - output_folder: Folder where the plot will be saved.
+    """
+    print(f"Generating full time series plot for station: {station_name}...")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Ensure gridlines are behind the plot elements
+    ax.set_axisbelow(True)
+    ax.grid(True, color='lightgray')
+
+    # Plot the full time series as a line
+    ax.plot(original_data.index, imputed_data[station_name], color="royalblue", linewidth=2.0, zorder=1)
+
+    # Overlay observed values with blue circles
+    ax.plot(original_data.index, imputed_data[station_name], 'o', markersize=6, color='lightblue',
+            markeredgecolor='royalblue', label="Observed", zorder=2)
+
+    # Highlight imputed values with red circles
+    ax.plot(original_data.index[imputed_mask[station_name]], 
+            imputed_data[station_name][imputed_mask[station_name]], 
+            'o', markersize=6, color='lightcoral', markeredgecolor='firebrick', label="Imputed", zorder=3)
+
+    # Add title and labels
+    plt.title(f"Groundwater Data for {station_name}")
+    plt.xlabel("Date")
+    plt.ylabel("Groundwater Level")
+
+    # Add legend
+    legend_handles = [
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightblue', markeredgecolor='royalblue', markersize=6, label="Observed"),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightcoral', markeredgecolor='firebrick', markersize=6, label="Imputed")
+    ]
+    ax.legend(handles=legend_handles, loc='upper right', fontsize=10, frameon=True)
+
+    # Save the plot
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    plt.savefig(os.path.join(output_folder, f"{station_name}.png"), dpi=600)
+    plt.close()
+    print(f"Full time series plot for station {station_name} saved.")
+
+def plot_monthly_station_data(imputed_data, imputed_mask, station_name, output_folder):
+    """
+    Generate 12 monthly plots for a specific station, showing the completed time series for each month.
+
+    Parameters:
+    - imputed_data: DataFrame of imputed data.
+    - imputed_mask: Boolean DataFrame indicating which values were imputed.
+    - station_name: Name of the station to plot.
+    - output_folder: Folder where the plots will be saved.
+    """
+    station_folder = os.path.join(output_folder, station_name)
+    if not os.path.exists(station_folder):
+        os.makedirs(station_folder)
+
+    station_data = imputed_data[station_name]
+    station_mask = imputed_mask[station_name]
+
+    # Display a single message and progress bar for each station's monthly plots
+    print(f"Generating monthly plots for {station_name}:")
+    for month in tqdm(range(1, 13), desc=f"Monthly plots for {station_name}"):
+        monthly_data = station_data[station_data.index.month == month]
+        monthly_mask = station_mask[station_mask.index.month == month]
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.set_axisbelow(True)
+        ax.grid(True, color='lightgray')
+
+        ax.plot(monthly_data.index, monthly_data, color="royalblue", linewidth=2.0, zorder=1)
+        ax.plot(monthly_data.index, monthly_data, 'o', markersize=6, color='lightblue', markeredgecolor='royalblue', label="Observed", zorder=2)
+        ax.plot(monthly_data.index[monthly_mask], monthly_data[monthly_mask], 'o', markersize=6, color='lightcoral', markeredgecolor='firebrick', label="Imputed", zorder=3)
+
+        month_name = calendar.month_name[month]
+        plt.title(f"{station_name} - {month_name}")  # Updated title format
+        plt.xlabel("Date")
+        plt.ylabel("Groundwater Level")
+
+        legend_handles = [
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightblue', markeredgecolor='royalblue', markersize=6, label="Observed"),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightcoral', markeredgecolor='firebrick', markersize=6, label="Imputed")
+        ]
+        ax.legend(handles=legend_handles, loc='upper right', fontsize=10, frameon=True)
+
+        filename = f"{station_name}_{month:02d}_{month_name}.png"
+        plt.savefig(os.path.join(station_folder, filename), dpi=600)
+        plt.close()
+
+# Main workflow
+if __name__ == "__main__":
+    print("Starting the imputation and plotting process...")
+
+    # Define input and output file paths
+    input_file = "GroundwaterDataInput.xlsx"
+    output_file = "GroundwaterDataImputed.xlsx"
+    full_series_output_folder = "Plots of Imputed Series"
+    monthly_output_folder = "Monthly Plots of Stations"
+
+    print(f"Loading data from {input_file}...")
+    df = pd.read_excel(input_file, index_col=0)
+    print("Data loaded.")
+
+    # Create KNN feature matrix
+    feature_matrix, original_indices = create_knn_feature_matrix(df)
+
+    # Apply KNN imputation
+    imputed_matrix = apply_knn_imputer(feature_matrix)
+
+    # Reconstruct the imputed data
+    imputed_data, imputed_mask = reconstruct_imputed_data(imputed_matrix, original_indices, df)
+
+    print("Preparing output for Excel...")
+    excel_output_data = imputed_data.copy()
+    excel_output_data.index = excel_output_data.index.to_period('M').astype(str)
+    excel_output_data.to_excel(output_file)
+    print(f"Excel output saved to {output_file}.")
+
+    # Generate and save full time series plots for each station
+    print("Generating full time series plots...")
+    for station in tqdm(df.columns, desc="Full series plots"):
+        plot_station_data(df, imputed_data, imputed_mask, station, full_series_output_folder)
+
+    # Generate and save monthly plots for all stations
+    print("Generating monthly plots for all stations...")
+    for station in df.columns:
+        plot_monthly_station_data(imputed_data, imputed_mask, station, monthly_output_folder)
+
+    print("All processes completed successfully.")
