@@ -1,1 +1,1051 @@
+"""
+Greece GW Drought — ALL-IN-ONE analysis, figures and study-area map (EN labels + _EN folders)
+
+This version merges all analyses/figures that existed in the Konya pipeline into the Greece pipeline,
+adds Greece CSV auto-detection (lon/lat + Jan-YY..Dec-YY), and standardizes well/grid IDs to short
+labels P01..P99 (here: P01..P57).
+
+Outputs (English labels; _EN folders)
+  • Tables (CSV): out_figs_EN/aux_tables/* (+ sgi_drought_events.csv, sgi_trend_analysis.csv, etc.)
+  • Publication-ready TIFFs (400 dpi): out_figs_EN/*.tiff
+  • Spatial maps of yearly drought metrics: out_SGI_spatial_EN/*.tiff
+  • Study-area map (wells on OSM basemap, no title): out_figs_EN/fig0_study_area_map.tiff
+  • SGI monthly time-series for each well: out_SGI_plots_EN/SGI_series_<WELL>.tiff
+  • Interpolated annual groundwater level maps (IDW): out_annual_gw_maps_EN/*.tiff
+"""
+from pathlib import Path
+from typing import Optional, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from scipy.stats import kendalltau
+from sklearn.cluster import DBSCAN
+import re
+
+# --- Optional geospatial stack (for the study-area basemap figure) ---
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point, box
+    import contextily as cx
+    HAS_GEO = True
+except Exception:
+    HAS_GEO = False
+
+# ---------------- PATHS & CONFIG ----------------
+# Yunanistan için örnek dosya adları — kendi yollarınla değiştir
+EXCEL_FILE = "groundwater level data missing removed.csv"                 # Excel/CSV (Yıl, Ay + P01..)
+COORD_FILE = "Greece.Well.Coordinates.csv"                       # lon/lat içeren koordinat dosyası
+OPTIONAL_BOUNDARY_FILE: Optional[str] = None                     # örn. "greece_boundary.geojson" / ".shp"
+
+# >>> All outputs go to _EN folders <<<
+OUT_FIGS = Path("./out_figs_EN")
+OUT_TBLS = OUT_FIGS / "aux_tables"
+OUT_SPATIAL = Path("./out_SGI_spatial_EN")
+OUT_SGI_SERIES = Path("./out_SGI_plots_EN")
+for p in [OUT_FIGS, OUT_TBLS, OUT_SPATIAL, OUT_SGI_SERIES]:
+    p.mkdir(parents=True, exist_ok=True)
+
+# --- Style ---
+START = pd.Timestamp("2002-04-01")
+END   = pd.Timestamp("2023-11-30")
+AUTO_TIME_FROM_DATA = True
+REGION_LABEL = "Greece"
+BASEMAP_PROVIDER = "CartoDB.Positron"
+#BASEMAP_PROVIDER = "CartoDB.Voyager"
+
+plt.rcParams.update({
+    "figure.dpi": 100,
+    "savefig.dpi": 400,
+    "font.size": 10.5,
+    "axes.labelsize": 11,
+    "axes.titlesize": 12.5,
+    "xtick.labelsize": 9.5,
+    "ytick.labelsize": 9.5,
+    "legend.fontsize": 9.5,
+    "figure.figsize": (6.0, 3.8),
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+def save_tiff(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(path, format="tiff", dpi=400, bbox_inches="tight")
+    plt.close()
+
+# ---------------- HELPERS ----------------
+def _norm_well_id(x) -> str:
+    """Normalize numeric-like labels '62555.0' -> '62555'; keep strings as-is."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().replace("\u200b", "")
+    s2 = s.replace(",", ".")
+    try:
+        f = float(s2)
+        if np.isfinite(f) and abs(f - round(f)) < 1e-12:
+            return str(int(round(f)))
+        return s
+    except Exception:
+        return s
+
+def _round_to_step(x, step=0.5, how="ceil"):
+    if x is None:
+        return x
+    try:
+        if not np.isfinite(x):
+            return x
+    except Exception:
+        return x
+    q = x / step
+    if how == "ceil":
+        return step * np.ceil(q)
+    elif how == "floor":
+        return step * np.floor(q)
+    else:
+        return step * np.round(q)
+
+# --- WELL ORDERING + SPARSE LABELS ---
+def _sorted_well_order(cols):
+    """Return wells sorted as P01, P02, ..., (case-insensitive)."""
+    def key_fn(w):
+        s = str(w).strip()
+        m = re.match(r'^[Pp](\d+)$', s)
+        if m:
+            try:
+                return (0, int(m.group(1)))
+            except Exception:
+                return (0, 10**6)
+        return (1, s.lower())
+    return sorted(list(cols), key=key_fn)
+
+def _sparse_y_labels(order, max_labels=18):
+    n = len(order)
+    if n == 0:
+        return [], []
+    step = max(1, int(np.ceil(n / max_labels)))
+    idx = np.arange(n)
+    lbls = []
+    for i, name in enumerate(order):
+        if i % step == 0 or i in (0, n - 1):
+            lbls.append(name)
+        else:
+            lbls.append("")
+    return idx, lbls
+
+# === Loader (Yıl + Ay; Turkish month names handled) ===
+def turkish_month_to_int(month):
+    MONTHS = {"Ocak":1,"Şubat":2,"Mart":3,"Nisan":4,"Mayıs":5,"Haziran":6,
+              "Temmuz":7,"Ağustos":8,"Eylül":9,"Ekim":10,"Kasım":11,"Aralık":12}
+    try:
+        return int(month)
+    except Exception:
+        return MONTHS.get(str(month).strip(), None)
+
+def build_timeseries(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Yıl" not in df.columns or "Ay" not in df.columns:
+        raise ValueError("Excel must have columns 'Yıl' and 'Ay'")
+    df["Yıl"] = df["Yıl"].ffill()
+    df["Ay"] = df["Ay"].apply(turkish_month_to_int)
+    df["Tarih"] = pd.to_datetime(
+        dict(year=pd.to_numeric(df["Yıl"], errors="coerce"),
+             month=pd.to_numeric(df["Ay"], errors="coerce"), day=1),
+        errors="coerce"
+    )
+    df = df.dropna(subset=["Tarih"])
+    ts_df = df.drop(columns=["Yıl", "Ay"]).set_index("Tarih")
+    ts_df = ts_df.apply(pd.to_numeric, errors="coerce")
+    ts_df.columns = [_norm_well_id(c) for c in ts_df.columns]
+    ts_df = ts_df.sort_index().asfreq("MS")
+    return ts_df
+
+# === SGI (z-score) ===
+def calculate_sgi(ts_df: pd.DataFrame) -> pd.DataFrame:
+    return (ts_df - ts_df.mean()) / ts_df.std(ddof=0)
+
+def extract_drought_events(series: pd.Series, thr=-1.0):
+    events, in_evt = [], False
+    start, sev, dur = None, 0.0, 0
+    for date, val in series.items():
+        if pd.notna(val) and val < thr:
+            if not in_evt:
+                in_evt = True
+                start, sev, dur = date, 0.0, 0
+            sev += abs(val); dur += 1
+        else:
+            if in_evt:
+                events.append({"well": series.name, "start": start,
+                               "end": date - pd.offsets.MonthBegin(1),
+                               "duration_mo": dur, "severity_sgi": sev})
+                in_evt = False
+    if in_evt:
+        events.append({"well": series.name, "start": start,
+                       "end": series.index[-1], "duration_mo": dur, "severity_sgi": sev})
+    return events
+
+def drought_metrics_yearly(sgi_df: pd.DataFrame, threshold=-1.0) -> pd.DataFrame:
+    rows = []
+    for well in sgi_df.columns:
+        s = sgi_df[well].dropna()
+        if s.empty:
+            continue
+        for year in sorted(set(s.index.year)):
+            s_year = s[s.index.year == year]
+            mask = s_year < threshold
+            max_dur, curr, ev_count = 0, 0, 0
+            for flag in mask:
+                if flag: curr += 1
+                else:
+                    if curr > 0: max_dur = max(max_dur, curr); ev_count += 1; curr = 0
+            if curr > 0: max_dur = max(max_dur, curr); ev_count += 1
+            min_sgi = s_year[mask].min() if mask.any() else np.nan
+            cum_def = float((-s_year[mask]).sum()) if mask.any() else 0.0
+            rows.append({"Well": _norm_well_id(well), "Year": int(year),
+                         "MaxDroughtDuration": int(max_dur),
+                         "MinSGI": float(min_sgi) if pd.notna(min_sgi) else np.nan,
+                         "CumulativeDeficit": cum_def,
+                         "NumEvents": int(ev_count)})
+    return pd.DataFrame(rows)
+
+def mann_kendall_sen(series_monthly: pd.Series) -> Tuple[float,float,float]:
+    s = series_monthly.dropna()
+    if len(s) < 10:
+        return np.nan, np.nan, np.nan
+    x = np.arange(len(s))
+    tau, p = kendalltau(x, s.values)
+    n = len(s); vals = s.values
+    slopes = []
+    for i in range(n - 1):
+        dv = (vals[i + 1:] - vals[i]) / (np.arange(i + 1, n) - i)
+        slopes.extend(dv.tolist())
+    sen_month = np.median(slopes)
+    return float(tau), float(p), float(sen_month * 12.0)
+
+def cluster_drought_periods(sgi_series: pd.Series, threshold=-1.0, eps=2, min_samples=2):
+    idx = np.where(sgi_series < threshold)[0]
+    if len(idx) < min_samples:
+        return []
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit(idx.reshape(-1,1)).labels_
+    clusters = []
+    for lab in sorted(set(labels)):
+        if lab == -1: continue
+        members = idx[labels == lab]
+        start = sgi_series.index[members[0]]
+        end   = sgi_series.index[members[-1]]
+        clusters.append((start, end, len(members)))
+    return clusters
+
+# ---------------- SPATIAL / STUDY-AREA MAP ----------------
+def _read_csv_autosep(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:
+        for sep in [",", ";", "\t", r"\s+"]:
+            try:
+                return pd.read_csv(path, sep=sep, engine="python", encoding="utf-8-sig")
+            except Exception:
+                continue
+    raise ValueError(f"Could not read CSV with common separators: {path}")
+
+def read_well_coordinates(path: Path) -> pd.DataFrame:
+    # Columnar layout (preferred)
+    try:
+        df = _read_csv_autosep(path)
+        cols = [str(c).strip().replace("\u200b", "") for c in df.columns]
+        df.columns = cols
+        cand_well = [c for c in cols if c.lower() in
+                     {"well","kuyu","kuyu_no","kuyuno","station","id","code","well_id","wellcode"}]
+        cand_x = [c for c in cols if c.lower() in
+                  {"x","easting","lon","longitude","utm_x","x_utm","xcoord","xcoord_utm"}]
+        cand_y = [c for c in cols if c.lower() in
+                  {"y","northing","lat","latitude","utm_y","y_utm","ycoord","ycoord_utm"}]
+        cand_z = [c for c in cols if c.lower() in
+                  {"groundelev","elev","elevation","z","height","elev_m","ground_elev"}]
+        if cand_well:
+            wcol = cand_well[0]
+            xcol = cand_x[0] if cand_x else None
+            ycol = cand_y[0] if cand_y else None
+            zcol = cand_z[0] if cand_z else None
+            out = pd.DataFrame({
+                "Well": df[wcol].apply(_norm_well_id),
+                "X": pd.to_numeric(df[xcol].astype(str).str.replace(",", ".", regex=False), errors="coerce") if xcol else np.nan,
+                "Y": pd.to_numeric(df[ycol].astype(str).str.replace(",", ".", regex=False), errors="coerce") if ycol else np.nan,
+                "GroundElev": pd.to_numeric(df[zcol].astype(str).str.replace(",", ".", regex=False), errors="coerce") if zcol else np.nan
+            }).dropna(subset=["Well"]).reset_index(drop=True)
+            if len(out) > 0:
+                return out
+    except Exception:
+        pass
+    # 3-row horizontal layout fallback
+    try:
+        df = _read_csv_autosep(path)
+        first_col = str(df.columns[0]).strip().lower()
+        row_labels = [str(v).strip().lower() for v in df.iloc[:, 0].tolist()]
+        if first_col in {"kuyu no","param","parametre","label",""} and set(["zemin kotu","x","y"]).issubset(set(row_labels)):
+            wells = [_norm_well_id(c) for c in df.columns[1:]]
+            idx = {lab: i for i, lab in enumerate(row_labels)}
+            gelev = pd.to_numeric(df.iloc[idx["zemin kotu"], 1:], errors="coerce")
+            xs = pd.to_numeric(df.iloc[idx["x"], 1:], errors="coerce")
+            ys = pd.to_numeric(df.iloc[idx["y"], 1:], errors="coerce")
+            out = pd.DataFrame({
+                "Well": wells,
+                "X": pd.to_numeric(pd.Series(xs).str.replace(",", ".", regex=False), errors="coerce"),
+                "Y": pd.to_numeric(pd.Series(ys).str.replace(",", ".", regex=False), errors="coerce"),
+                "GroundElev": pd.to_numeric(pd.Series(gelev).str.replace(",", ".", regex=False), errors="coerce"),
+            }).dropna(subset=["Well"]).reset_index(drop=True)
+            if len(out) > 0:
+                return out
+    except Exception:
+        pass
+    raise ValueError(f"Could not parse coordinates file layout: {path}")
+
+def _guess_crs_from_xy(df_coords: pd.DataFrame) -> str:
+    x = df_coords["X"].astype(float); y = df_coords["Y"].astype(float)
+    if x.abs().max() <= 180 and y.abs().max() <= 90: return "EPSG:4326"
+    return "EPSG:3857"
+
+def _add_north_arrow(ax, size=0.05, pad=0.02):
+    try:
+        x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+        xm = x0 + 0.08 * (x1 - x0)
+        y_base = y0 + 0.78 * (y1 - y0)
+        arrow_len = 0.12 * (y1 - y0)
+        ax.annotate(
+            'N',
+            xy=(xm, y_base + arrow_len),
+            xytext=(xm, y_base),
+            ha='center', va='bottom',
+            fontsize=9,
+            arrowprops=dict(arrowstyle='-|>', lw=1.2)
+        )
+    except Exception:
+        pass
+
+def _add_scale_bar(ax, length_km=10):
+    try:
+        x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+        xm = x0 + 0.1 * (x1 - x0); ym = y0 + 0.06 * (y1 - y0)
+        length_m = length_km * 1000.0
+        ax.plot([xm, xm + length_m], [ym, ym], color='k', lw=2)
+        ax.plot([xm, xm], [ym-0.01*(y1-y0), ym+0.01*(y1-y0)], color='k', lw=2)
+        ax.plot([xm+length_m, xm+length_m], [ym-0.01*(y1-y0), ym+0.01*(y1-y0)], color='k', lw=2)
+        ax.text(xm + length_m/2, ym + 0.012*(y1-y0), f"{length_km} km",
+                ha='center', va='bottom', fontsize=8)
+    except Exception:
+        pass
+
+def _resolve_cx_provider(name: str):
+    prov = cx.providers
+    for part in str(name).split("."):
+        prov = getattr(prov, part)
+    return prov
+
+def plot_study_area_map(coords_df: pd.DataFrame,
+                        boundary_path: Optional[str],
+                        provider: str,
+                        out_path: Path):
+    """Study-area basemap (English tiles) for Greece."""
+    SHOW_LABELS = True
+
+    if not HAS_GEO:
+        print("[INFO] geopandas/contextily not available; drawing simple scatter without basemap.")
+        plt.figure(figsize=(7.2, 5.6))
+        plt.scatter(
+            coords_df["X"], coords_df["Y"],
+            s=7, c='deepskyblue', edgecolors='royalblue',
+            linewidths=0.7, alpha=0.9
+        )
+        if SHOW_LABELS and "Well" in coords_df.columns:
+            ax = plt.gca()
+            for _, r in coords_df.iterrows():
+                ax.annotate(
+                    str(r["Well"]), (r["X"], r["Y"]),
+                    xytext=(3, 3), textcoords="offset points",
+                    fontsize=7, color="black"
+                )
+        plt.xlabel("Longitude or X"); plt.ylabel("Latitude or Y")
+        save_tiff(out_path)
+        return
+
+    try:
+        gdf = gpd.GeoDataFrame(
+            coords_df.copy(),
+            geometry=[Point(xy) for xy in zip(coords_df["X"], coords_df["Y"])],
+            crs="EPSG:4326"
+        )
+        ax = gdf.to_crs("EPSG:3857").plot(
+            figsize=(7.2, 5.6),
+            markersize=12, color='deepskyblue',
+            edgecolor='royalblue', linewidth=0.7, alpha=0.9
+        )
+
+        if boundary_path:
+            try:
+                b = gpd.read_file(boundary_path)
+                b.to_crs(epsg=3857).boundary.plot(ax=ax, color='k', linewidth=0.8)
+            except Exception as e:
+                print(f"[WARN] Could not read boundary: {e}")
+
+        try:
+            prov = _resolve_cx_provider(BASEMAP_PROVIDER)
+            cx.add_basemap(ax, source=prov, crs="EPSG:3857", attribution=False)
+        except Exception as e:
+            print(f"[WARN] Basemap failed for {BASEMAP_PROVIDER}: {e}; falling back to OSM Mapnik.")
+            try:
+                cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857", attribution=False)
+            except Exception as e2:
+                print("[WARN] Basemap fallback also failed:", e2)
+
+        if SHOW_LABELS and "Well" in coords_df.columns:
+            gdf3857 = gdf.to_crs(3857)
+            for _, r in gdf3857.iterrows():
+                x, y = r.geometry.x, r.geometry.y
+                ax.annotate(
+                    str(r["Well"]), (x, y),
+                    xytext=(3, 3), textcoords="offset points",
+                    fontsize=7, color="rebeccapurple",
+                    fontweight="bold"
+                )
+
+        _add_north_arrow(ax)
+        _add_scale_bar(ax, length_km=20)
+        ax.set_axis_off()
+        plt.tight_layout()
+        plt.savefig(out_path, format="tiff", dpi=400, bbox_inches="tight")
+        plt.close()
+
+    except Exception as e:
+        print(f"[WARN] Basemap plot failed: {e}. Falling back to scatter.")
+        plt.figure(figsize=(7.2, 5.6))
+        plt.scatter(
+            coords_df["X"], coords_df["Y"],
+            s=12, c='deepskyblue', edgecolors='royalblue',
+            linewidths=0.7, alpha=0.9
+        )
+        if SHOW_LABELS and "Well" in coords_df.columns:
+            ax = plt.gca()
+            for _, r in coords_df.iterrows():
+                ax.annotate(
+                    str(r["Well"]), (r["X"], r["Y"]),
+                    xytext=(3, 3), textcoords="offset points",
+                    fontsize=7, color="rebeccapurple",
+                    fontweight="bold"
+                )
+        plt.xlabel("Longitude or X"); plt.ylabel("Latitude or Y")
+        save_tiff(out_path)
+
+def plot_greece_locator_map(coords_df: pd.DataFrame, out_path: Path, pad_frac: float = 0.08):
+    """
+    Country-scale locator map framed to Greece's geographic bounds, plotting wells and a RED rectangle.
+    """
+    # Greece geographic bounds (lon/lat) — yaklaşık
+    GRC_LON_MIN, GRC_LON_MAX = 19.0, 30.0
+    GRC_LAT_MIN, GRC_LAT_MAX = 34.0, 42.2
+
+    x = coords_df["X"].astype(float)
+    y = coords_df["Y"].astype(float)
+    if len(x) == 0:
+        raise ValueError("No coordinates to plot.")
+
+    xmin, xmax = x.min(), x.max()
+    ymin, ymax = y.min(), y.max()
+    dx, dy = (xmax - xmin) * pad_frac, (ymax - ymin) * pad_frac
+    xmin_p, xmax_p = xmin - dx, xmax + dx
+    ymin_p, ymax_p = ymin - dy, ymax + dy
+
+    if not HAS_GEO:
+        plt.figure(figsize=(8.0, 6.0))
+        plt.scatter(x, y, s=14, c="tab:blue", edgecolor="white", linewidth=0.4, zorder=2)
+        rect = plt.Rectangle((xmin_p, ymin_p), xmax_p - xmin_p, ymax_p - ymin_p,
+                             fill=False, edgecolor="red", linewidth=2.0, zorder=3)
+        ax = plt.gca()
+        ax.add_patch(rect)
+        ax.set_xlim(GRC_LON_MIN, GRC_LON_MAX)
+        ax.set_ylim(GRC_LAT_MIN, GRC_LAT_MAX)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_title("Greece — study area locator map")
+        save_tiff(out_path)
+        return
+
+    gpts = gpd.GeoDataFrame(
+        coords_df.copy(),
+        geometry=[Point(xx, yy) for xx, yy in zip(x, y)],
+        crs="EPSG:4326"
+    ).to_crs(3857)
+
+    rect_ll = gpd.GeoDataFrame(geometry=[box(xmin_p, ymin_p, xmax_p, ymax_p)], crs="EPSG:4326").to_crs(3857)
+    grc_ll  = gpd.GeoDataFrame(geometry=[box(GRC_LON_MIN, GRC_LAT_MIN, GRC_LON_MAX, GRC_LAT_MAX)], crs="EPSG:4326").to_crs(3857)
+
+    fig, ax = plt.subplots(figsize=(8.2, 6.2))
+    minx, miny, maxx, maxy = grc_ll.total_bounds
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+
+    try:
+        cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, crs="EPSG:3857", attribution=False, zoom=5)
+    except Exception as e:
+        print("[WARN] Basemap failed:", e)
+
+    grc_ll.boundary.plot(ax=ax, color="#999999", linewidth=0.6, zorder=1)
+    rect_ll.boundary.plot(ax=ax, color="red", linewidth=2.0, zorder=4)
+    gpts.plot(ax=ax, markersize=10, color="tab:blue", alpha=0.9, edgecolor="white", linewidth=0.5, zorder=5)
+
+    ax.set_axis_off()
+    ax.set_title("Greece — study area locator map", fontsize=12.5)
+    plt.tight_layout()
+    plt.savefig(out_path, format="tiff", dpi=400, bbox_inches="tight")
+    plt.close()
+
+# === GRID HELPERS: detect & load grid CSV (lon/lat + monthly Jan-YY..Dec-YY) ===
+MON_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MON_MAP = {m:i+1 for i,m in enumerate(MON_ABBR)}
+
+def _looks_like_month_col(c):
+    if not isinstance(c, str): c = str(c)
+    c = c.strip()
+    return bool(re.match(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2}$", c))
+
+def _parse_mmmyy_to_timestamp(txt):
+    m = re.match(r"^(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(?P<yy>\d{2})$", str(txt).strip())
+    if not m: return pd.NaT
+    mon = MON_MAP[m.group("mon")]; yy = int(m.group("yy"))
+    year = 2000 + yy if yy <= 29 else 1900 + yy
+    return pd.Timestamp(year=year, month=mon, day=1)
+
+def is_grid_timeseries(df: pd.DataFrame) -> bool:
+    cols = [str(c).strip().lower() for c in df.columns]
+    lon_alias = {"lon","longitude","x","easting"}
+    lat_alias = {"lat","latitude","y","northing"}
+    has_lon = any(c in lon_alias for c in cols)
+    has_lat = any(c in lat_alias for c in cols)
+    if not (has_lon and has_lat): return False
+    month_like = any(_looks_like_month_col(c2 if isinstance(c2, str) else str(c2)) for c2 in df.columns)
+    return month_like
+
+def load_grid_timeseries(path: str):
+    raw = pd.read_csv(path, encoding="utf-8-sig")
+    cols = [str(c).strip() for c in raw.columns]; cols_l = [c.lower() for c in cols]
+    lon_idx = next((i for i,c in enumerate(cols_l) if c in ["longitude","lon","x","easting"]), None)
+    lat_idx = next((i for i,c in enumerate(cols_l) if c in ["latitude","lat","y","northing"]), None)
+    if lon_idx is None or lat_idx is None:
+        raise ValueError("Longitude/latitude columns not found in grid CSV.")
+    lon_col = raw.columns[lon_idx]; lat_col = raw.columns[lat_idx]
+
+    month_cols = [c for c in raw.columns if _looks_like_month_col(c)]
+    if not month_cols: raise ValueError("No monthly columns like Jan-03 found in grid CSV.")
+
+    long_df = raw.melt(id_vars=[lon_col, lat_col], value_vars=month_cols, var_name="MonthYY", value_name="Value")
+    long_df["Tarih"] = long_df["MonthYY"].apply(_parse_mmmyy_to_timestamp)
+    long_df = long_df.dropna(subset=["Tarih"])
+
+    uniq_points = raw[[lon_col, lat_col]].drop_duplicates().reset_index(drop=True)
+    uniq_points["Well"] = ["P" + str(i+1).zfill(2) for i in range(len(uniq_points))]
+
+    long_df = long_df.merge(uniq_points, left_on=[lon_col, lat_col], right_on=[lon_col, lat_col], how="left")
+
+    ts_df = long_df.pivot_table(index="Tarih", columns="Well", values="Value", aggfunc="mean").sort_index()
+    ts_df = ts_df.asfreq("MS")
+
+    coords_df = uniq_points.rename(columns={lon_col: "X", lat_col: "Y"})[["Well","X","Y"]].copy()
+    coords_df["GroundElev"] = np.nan
+
+    ts_df.columns = [_norm_well_id(c) for c in ts_df.columns]
+    coords_df["Well"] = coords_df["Well"].apply(_norm_well_id)
+    return ts_df, coords_df
+
+# ---------------- MAIN PIPELINE ----------------
+def main():
+    # Detect file type and load data accordingly
+    ext = Path(EXCEL_FILE).suffix.lower()
+    if ext == '.csv':
+        raw = pd.read_csv(EXCEL_FILE, encoding='utf-8-sig')
+        if is_grid_timeseries(raw):
+            df, coords_df = load_grid_timeseries(EXCEL_FILE)
+        else:
+            raise ValueError("CSV provided but it does not match the expected grid format (lon/lat + Jan-YY... columns).")
+    else:
+        raw = pd.read_excel(EXCEL_FILE)
+        df = build_timeseries(raw)
+        coords_df = read_well_coordinates(Path(COORD_FILE))
+
+    # Time range handling
+    if AUTO_TIME_FROM_DATA and not df.empty:
+        start_eff = df.index.min(); end_eff = df.index.max()
+    else:
+        start_eff, end_eff = START, END
+    df = df.loc[(df.index >= start_eff) & (df.index <= end_eff)]
+    df = df.apply(pd.to_numeric, errors="coerce")
+
+    if df.empty or df.shape[1] == 0:
+        raise ValueError("No data after filtering or no well/grid columns found.")
+
+    # --- Annual summaries (depths) ---
+    annual = df.resample("YE").mean()
+    annual.index = annual.index.year.astype(int)
+    annual_delta = annual.diff()
+    basin_annual_mean = annual.mean(axis=1)
+
+    # Sen slope & Kendall tau on annual depths
+    def _sen_slope(y_vals: np.ndarray, t_vals: np.ndarray) -> float:
+        y_vals = np.asarray(y_vals, float); t_vals = np.asarray(t_vals, float)
+        mask = np.isfinite(y_vals) & np.isfinite(t_vals)
+        y = y_vals[mask]; t = t_vals[mask]; n = len(y)
+        if n < 2: return np.nan
+        slopes = []
+        for i in range(n-1):
+            dt = t[i+1:] - t[i]; dy = y[i+1:] - y[i]
+            valid = dt != 0
+            if np.any(valid): slopes.append(dy[valid] / dt[valid])
+        if not slopes: return np.nan
+        return float(np.nanmedian(np.concatenate(slopes)))
+
+    yrs = annual.index.values.astype(float)
+    trend_rows_depth = []
+    for well in annual.columns:
+        yy = annual[well].values.astype(float)
+        if np.isfinite(yy).sum() >= 3:
+            sen = _sen_slope(yy, yrs)
+            idx = np.isfinite(yy)
+            tau, p = kendalltau(np.arange(np.sum(idx)), yy[idx])
+        else:
+            sen, tau, p = np.nan, np.nan, np.nan
+        trend_rows_depth.append({"Well": well, "slope_m_per_year": sen, "tau": tau, "p": p})
+    trend_df_depth = pd.DataFrame(trend_rows_depth).set_index("Well")
+    trend_df_depth.to_csv(OUT_TBLS / "trend_depth_mk_sen_annual.csv", float_format="%.6f")
+
+    # === SGI ===
+    sgi = calculate_sgi(df).sort_index()
+
+    # Drought events & yearly metrics
+    events = []
+    for col in sgi.columns:
+        events += extract_drought_events(sgi[col], thr=-1.0)
+    events_df = pd.DataFrame(events)
+    events_df.to_csv(OUT_TBLS / "sgi_drought_events.csv", index=False)
+
+    yearly_metrics = drought_metrics_yearly(sgi, threshold=-1.0)
+    yearly_metrics.to_csv(OUT_TBLS / "drought_metrics_yearly.csv", index=False)
+
+    # SGI trend (Mann–Kendall + Sen per well)
+    trend_rows = []
+    for col in sgi.columns:
+        tau, p, sen = mann_kendall_sen(sgi[col])
+        trend_rows.append({"well": col, "tau": tau, "p_value": p, "sen_slope_per_year": sen})
+    trend_df = pd.DataFrame(trend_rows).set_index("well").sort_values("sen_slope_per_year")
+    trend_df.to_csv(OUT_TBLS / "sgi_trend_analysis.csv", float_format="%.6f")
+
+    # === Fig. 10 — Trend map (Sen slope m/year via IDW) with MK significance ===
+    trend_rows_depth = []
+    tt = annual.index.values.astype(float)
+    for well in annual.columns:
+        yy = annual[well].values.astype(float)
+        if np.isfinite(yy).sum() >= 3:
+            def _sen_slope_local(y_vals: np.ndarray, t_vals: np.ndarray) -> float:
+                y_vals = np.asarray(y_vals, float); t_vals = np.asarray(t_vals, float)
+                mask = np.isfinite(y_vals) & np.isfinite(t_vals)
+                y = y_vals[mask]; t = t_vals[mask]; n = len(y)
+                if n < 2: return np.nan
+                slopes = []
+                for i in range(n-1):
+                    dt = t[i+1:] - t[i]; dy = y[i+1:] - y[i]
+                    valid = dt != 0
+                    if np.any(valid): slopes.append(dy[valid] / dt[valid])
+                return float(np.nanmedian(np.concatenate(slopes))) if slopes else np.nan
+            sen = _sen_slope_local(yy, tt)
+            tau, p = kendalltau(np.arange(len(yy))[np.isfinite(yy)], yy[np.isfinite(yy)])
+        else:
+            sen, tau, p = np.nan, np.nan, np.nan
+        trend_rows_depth.append({"Well": _norm_well_id(well), "slope_m_per_year": sen, "tau": tau, "p": p})
+    tr_df = pd.DataFrame(trend_rows_depth)
+    tr_df.to_csv(OUT_TBLS / "fig10_trend_table.csv", index=False, float_format="%.6f")
+    tr_map = coords_df.merge(tr_df, on="Well", how="left")
+    pts = tr_map[np.isfinite(tr_map["X"]) & np.isfinite(tr_map["Y"]) & np.isfinite(tr_map["slope_m_per_year"])].copy()
+    if len(pts) >= 3:
+        xmin, xmax = coords_df["X"].min(), coords_df["X"].max()
+        ymin, ymax = coords_df["Y"].min(), coords_df["Y"].max()
+        dx, dy = (xmax - xmin) * 0.10, (ymax - ymin) * 0.10
+        Xi, Yi, Zi, extent = _idw_grid(pts["X"].values, pts["Y"].values, pts["slope_m_per_year"].values,
+                                       xmin - dx, xmax + dx, ymin - dy, ymax + dy, nx=300, power=2)
+        vmin = float(np.nanmin(pts["slope_m_per_year"].values)); vmax = float(np.nanmax(pts["slope_m_per_year"].values))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax: vmin, vmax = -0.2, 0.2
+        levels = np.arange(np.floor(vmin*5)/5, np.ceil(vmax*5)/5 + 0.5, 0.5)
+        fig, ax = plt.subplots(figsize=(7.2, 5.6))
+        im = ax.imshow(Zi, origin="lower", extent=[extent[0], extent[1], extent[2], extent[3]], cmap="RdYlBu", vmin=vmin, vmax=vmax)
+        try:
+            cs = ax.contour(Xi, Yi, Zi, levels=levels, colors="k", linewidths=0.5, alpha=0.7)
+            ax.clabel(cs, inline=True, fontsize=7, fmt="%.1f")
+        except Exception:
+            pass
+        sig = (tr_map["p"] < 0.05) & np.isfinite(tr_map["p"])
+        ax.scatter(tr_map.loc[sig,"X"], tr_map.loc[sig,"Y"], marker="+", s=80, c="black", linewidths=1.4, zorder=4)
+        ax.scatter(pts["X"], pts["Y"], s=26, c="white", edgecolor="black", linewidth=0.8, zorder=3)
+        for _, r in pts.iterrows():
+            ax.annotate(str(r["Well"]), (r["X"], r["Y"]), xytext=(3,3), textcoords="offset points", fontsize=7, color="k", zorder=5)
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_xlabel(""); ax.set_ylabel("")
+        for sp in ax.spines.values(): sp.set_visible(True); sp.set_color("black"); sp.set_linewidth(1.0)
+        ax.set_title("Fig. 10 — Sen slope (m/year) [IDW] and MK significance (p<0.05: +)")
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax); cax = divider.append_axes("right", size="3%", pad=0.10)
+        cbar = plt.colorbar(im, cax=cax); cbar.set_label("Sen slope (m/year)")
+        plt.savefig(OUT_FIGS / "fig10_trend_map.tiff", dpi=400, format="tiff"); plt.close()
+
+    # === Fig. 11 — GW-NDSPI map (sum of SGI < -1) via IDW ===
+    if isinstance(sgi.index, pd.DatetimeIndex):
+        sgi_period = sgi.loc[str(int(df.index.min().year))+"-01-01":str(int(df.index.max().year))+"-12-31"]
+    else:
+        sgi_period = sgi.copy()
+    ndspi_vals = sgi_period.where(sgi_period < -1.0, 0.0).sum(axis=0)
+    df_ndspi = pd.DataFrame({"Well": ndspi_vals.index.map(_norm_well_id), "Value": ndspi_vals.values})
+    merged = coords_df.copy(); merged["Well"] = merged["Well"].apply(_norm_well_id)
+    merged = merged.merge(df_ndspi, on="Well", how="left")
+    pts_b = merged.dropna(subset=["X","Y","Value"])
+    if len(pts_b) >= 3:
+        xmin, xmax = coords_df["X"].min(), coords_df["X"].max()
+        ymin, ymax = coords_df["Y"].min(), coords_df["Y"].max()
+        dx, dy = (xmax - xmin) * 0.10, (ymax - ymin) * 0.10
+        Xi, Yi, Zi, extent = _idw_grid(pts_b["X"].values, pts_b["Y"].values, pts_b["Value"].values,
+                                       xmin - dx, xmax + dx, ymin - dy, ymax + dy, nx=300, power=2)
+        data_min = float(np.nanmin(pts_b["Value"].values)); data_max = float(np.nanmax(pts_b["Value"].values))
+        def _round_to_base(x, base=2, how="floor"):
+            if not np.isfinite(x): return np.nan
+            if how == "floor": return base * np.floor(x / base)
+            elif how == "ceil": return base * np.ceil(x / base)
+            else: return base * np.round(x / base)
+        vmin_b = _round_to_base(data_min, base=2, how="floor"); vmax_b = _round_to_base(data_max, base=2, how="ceil")
+        if not np.isfinite(vmin_b) or not np.isfinite(vmax_b) or vmin_b == vmax_b: vmin_b, vmax_b = -2, 2
+        levels_b = np.arange(vmin_b, vmax_b + 2, 2)
+        fig, ax = plt.subplots(figsize=(7.2, 5.6))
+        im = ax.imshow(Zi, origin="lower", extent=[extent[0], extent[1], extent[2], extent[3]], cmap="RdYlBu", vmin=vmin_b, vmax=vmax_b)
+        try:
+            cs = ax.contour(Xi, Yi, Zi, levels=levels_b, colors="k", linewidths=0.5, alpha=0.75)
+            ax.clabel(cs, inline=True, fontsize=7, fmt="%.0f")
+        except Exception:
+            pass
+        ax.scatter(pts_b["X"], pts_b["Y"], s=36, c="forestgreen", edgecolor="darkgreen", linewidth=0.7, zorder=3)
+        for _, r in pts_b.iterrows():
+            ax.annotate(str(r["Well"]), (r["X"], r["Y"]), xytext=(3,3), textcoords="offset points", fontsize=7, color="k")
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_xlabel(""); ax.set_ylabel("")
+        for sp in ax.spines.values(): sp.set_visible(True); sp.set_color("black"); sp.set_linewidth(1.0)
+        ax.set_title("Fig. 11 — GW-NDSPI (sum of SGI < -1) — IDW")
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax); cax = divider.append_axes("right", size="3%", pad=0.10)
+        cbar = plt.colorbar(im, cax=cax); cbar.set_label("Sum of (SGI <-1)")
+        plt.savefig(OUT_FIGS / "fig11b_gw_ndspi_map.tiff", dpi=400, format="tiff"); plt.close()
+
+    # --- Figures ---
+    # Fig 1 — Basin annual mean depth
+    if len(basin_annual_mean) >= 1:
+        plt.figure()
+        plt.plot(
+            basin_annual_mean.index, basin_annual_mean.values,
+            marker="o",
+            color="steelblue",
+            linewidth=1.4,
+            markerfacecolor="lightskyblue",
+            markeredgecolor="darkblue",
+            markeredgewidth=0.8
+        )
+        plt.xlabel("Year"); plt.ylabel("Groundwater depth (m)")
+        title_years = f"{int(annual.index.min())}–{int(annual.index.max())}" if len(annual.index)>0 else ""
+        plt.title(f"Basin annual mean groundwater depth ({REGION_LABEL}, {title_years})")
+        save_tiff(OUT_FIGS / "fig1_basin_annual_mean.tiff")
+
+    # Fig 2 — Annual mean depth heatmap (wells × years)
+    if (annual.shape[0] >= 1) and (annual.shape[1] >= 1):
+        well_order = _sorted_well_order(annual.columns)
+        annual_sorted = annual.reindex(columns=well_order)
+
+        fig, ax = plt.subplots(figsize=(7.2, 5.0))
+        im = ax.imshow(annual_sorted.T.values, aspect="auto", interpolation="nearest")
+        ax.set_xlabel("Year"); ax.set_ylabel("Well")
+
+        ax.set_xticks(np.arange(len(annual_sorted.index)))
+        ax.set_xticklabels(annual_sorted.index.astype(int), rotation=45, ha="right")
+
+        yticks, ylabels = _sparse_y_labels(well_order, max_labels=18)
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels)
+
+        cbar = plt.colorbar(im, ax=ax); cbar.set_label("Depth (m)")
+        ax.set_title("Annual mean groundwater depth (wells × years)")
+        save_tiff(OUT_FIGS / "fig2_annual_mean_heatmap.tiff")
+
+    # Fig 3 — SGI Sen’s slope per well (with p<0.05 markers)
+    if trend_df.shape[0] >= 1:
+        well_order = _sorted_well_order(trend_df.index)
+        trend_plot = trend_df.reindex(well_order)
+
+        fig, ax = plt.subplots(figsize=(6.0, 5.2))
+        ax.barh(np.arange(len(trend_plot.index)), trend_plot["sen_slope_per_year"].values, color="0.4")
+
+        for y, (well, row) in enumerate(trend_plot.iterrows()):
+            if pd.notna(row.get("p_value", np.nan)) and row["p_value"] < 0.05:
+                ax.plot(row["sen_slope_per_year"], y, marker="*", markersize=7, color="black")
+
+        ax.axvline(0, color="k", linewidth=0.8)
+        ax.set_xlabel("Sen’s slope of SGI (per year)"); ax.set_ylabel("Well")
+
+        yticks, ylabels = _sparse_y_labels(well_order, max_labels=18)
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels)
+
+        ax.set_title("SGI trend per well (Sen’s slope, * = p<0.05)")
+        save_tiff(OUT_FIGS / "fig3_sgi_sen_slope_per_well.tiff")
+
+    # Fig 4 — SGI heatmap (wells × months; continuous timeline)
+    if (sgi.shape[0] >= 1) and (sgi.shape[1] >= 1):
+        dates = sgi.index
+        year_starts = [i for i, d in enumerate(dates) if d.month == 1]
+
+        well_order2 = _sorted_well_order(sgi.columns)
+        data_to_plot = sgi[well_order2].T.to_numpy()
+        data_masked = np.ma.masked_invalid(data_to_plot)
+
+        fig, ax = plt.subplots(figsize=(7.2, 5.0))
+        im = ax.imshow(
+            data_masked, aspect="auto", cmap="RdBu", vmin=-2.5, vmax=2.5,
+            interpolation="none", origin="lower",
+            extent=[0, len(dates), 0, len(well_order2)]
+        )
+        ax.set_xlabel("Time"); ax.set_ylabel("Well")
+
+        yticks, ylabels = _sparse_y_labels(well_order2, max_labels=18)
+        ax.set_yticks(yticks + 0.5)
+        ax.set_yticklabels(ylabels)
+
+        if len(year_starts) >= 1:
+            ax.set_xticks(year_starts)
+            ax.set_xticklabels([str(d.year) for d in dates[year_starts]], rotation=45, ha="right")
+
+        cbar = plt.colorbar(im, ax=ax); cbar.set_label("SGI")
+        ax.set_title("Standardized Groundwater Index (SGI) — wells × months")
+        save_tiff(OUT_FIGS / "fig4_sgi_heatmap.tiff")
+
+    # Fig 5 — Drought timelines (SGI < -1.0)
+    dates = sgi.index
+    if len(dates) >= 2:
+        well_order3 = _sorted_well_order(sgi.columns)
+
+        evs = []
+        for col in sgi.columns:
+            evs += extract_drought_events(sgi[col], thr=-1.0)
+        events_df2 = pd.DataFrame(evs)
+
+        if not events_df2.empty:
+            date_to_pos = {d: i for i, d in enumerate(dates)}
+            year_starts = [i for i, d in enumerate(dates) if d.month == 1]
+            fig, ax = plt.subplots(figsize=(7.6, 5.0))
+
+            for _, ev in events_df2.iterrows():
+                w = ev["well"]
+                if w not in well_order3: 
+                    continue
+                y = well_order3.index(w)
+                s = pd.Timestamp(ev["start"]); e = pd.Timestamp(ev["end"])
+                if s not in date_to_pos or e not in date_to_pos:
+                    continue
+                span = (e.year - s.year) * 12 + (e.month - s.month) + 1
+                ax.broken_barh([(date_to_pos[s], span)], (y - 0.4, 0.8), facecolor="0.25")
+
+            ax.set_ylim(-1, len(well_order3)); ax.set_xlim(0, max(len(dates)-1, 1))
+
+            yticks, ylabels = _sparse_y_labels(well_order3, max_labels=18)
+            ax.set_yticks(yticks)
+            ax.set_yticklabels(ylabels)
+
+            if len(year_starts) >= 1:
+                ax.set_xticks(year_starts)
+                ax.set_xticklabels([str(d.year) for d in dates[year_starts]], rotation=45, ha="right")
+
+            ax.set_xlabel("Time"); ax.set_ylabel("Well")
+            ax.set_title("Groundwater drought timelines (SGI < -1)")
+            save_tiff(OUT_FIGS / "fig5_drought_timelines.tiff")
+
+    # Fig 6 — Annual change (Δ) boxplots by year
+    annual_delta = annual.diff()
+    valid_years = [int(y) for y in annual_delta.index if pd.Series(annual_delta.loc[y]).notna().any()]
+    data_box = [annual_delta.loc[y].dropna().values for y in valid_years]
+
+    if len(valid_years) >= 1 and len(data_box) == len(valid_years):
+        fig, ax = plt.subplots(figsize=(6.4, 4.0))
+        ax.boxplot(data_box, showfliers=False)  # tick_labels yok!
+        ax.set_xticks(range(1, len(valid_years) + 1))
+        ax.set_xticklabels([str(y) for y in valid_years], rotation=45, ha="right")
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Annual change Δ depth (m)")
+        ax.set_title("Distribution of annual groundwater change across wells")
+        save_tiff(OUT_FIGS / "fig6_annual_change_boxplots.tiff")
+
+    # Fig 7 — Basin monthly climatology (mean) with IQR across wells
+    if df.shape[0] >= 12:
+        months = np.arange(1, 13)
+        monthly_basin = df.mean(axis=1)
+        clim_mean = [monthly_basin[monthly_basin.index.month == m].mean() for m in months]
+        iqr_low, iqr_high = [], []
+        for m in months:
+            vals = df[df.index.month == m].mean(axis=0)
+            if vals.size == 0 or np.all(np.isnan(vals.values)):
+                iqr_low.append(np.nan); iqr_high.append(np.nan)
+            else:
+                q25, q75 = np.nanpercentile(vals.values, [25, 75])
+                iqr_low.append(q25); iqr_high.append(q75)
+        plt.figure(figsize=(6.2, 3.8))
+        plt.plot(months, clim_mean, marker="o")
+        if not np.all(np.isnan(iqr_low)) and not np.all(np.isnan(iqr_high)):
+            plt.fill_between(months, iqr_low, iqr_high, alpha=0.25)
+        plt.xticks(months, MON_ABBR)
+        plt.xlabel("Month"); plt.ylabel("Groundwater depth (m)")
+        plt.title("Basin monthly climatology (mean) with IQR across wells")
+        save_tiff(OUT_FIGS / "fig7_monthly_climatology_iqr.tiff")
+
+    # 6) SPATIAL MAPS (yearly drought metrics; point colors)
+    try:
+        if ext == '.csv' and is_grid_timeseries(pd.read_csv(EXCEL_FILE, nrows=5)):
+            pass
+        coords_use = coords_df.dropna(subset=["X","Y"]).copy()
+        coords_use.to_csv(OUT_SPATIAL / "_coords_parsed.csv", index=False)
+        years = sorted(yearly_metrics["Year"].unique().tolist()) if not yearly_metrics.empty else []
+        for metric in ["MaxDroughtDuration","MinSGI","CumulativeDeficit","NumEvents"]:
+            for y in years:
+                cdf = coords_use.copy(); mdf = yearly_metrics.copy()
+                mdf = mdf[mdf["Year"] == y]
+                merged = cdf.merge(mdf[["Well","Year",metric]], on="Well", how="left")
+                if merged.empty: continue
+                vals = pd.to_numeric(merged[metric], errors="coerce")
+                vmin = np.nanmin(vals) if np.any(~np.isnan(vals)) else 0.0
+                vmax = np.nanmax(vals) if np.any(~np.isnan(vals)) else 0.0
+                if not np.isfinite(vmin): vmin = 0.0
+                if not np.isfinite(vmax): vmax = 0.0
+                if abs(vmax - vmin) < 1e-9: vmax = vmin + 1e-6
+                plt.figure(figsize=(6.2, 4.8))
+                sc = plt.scatter(merged["X"], merged["Y"], c=vals, cmap='YlOrRd',
+                                 vmin=vmin, vmax=vmax, s=120, edgecolor='black')
+                plt.colorbar(sc, label=metric)
+                plt.xlabel("Longitude/X"); plt.ylabel("Latitude/Y")
+                plt.title(f"{metric} — {y}")
+                plt.grid(alpha=0.25)
+                save_tiff(OUT_SPATIAL / f"spatial_{metric}_{y}.tiff")
+    except Exception as e:
+        print("[WARN] Spatial metrics mapping failed:", e)
+
+    # 7) STUDY-AREA MAPS (OSM + locator)
+    try:
+        plot_study_area_map(coords_df, OPTIONAL_BOUNDARY_FILE, BASEMAP_PROVIDER,
+                            OUT_FIGS / "fig0_study_area_map.tiff")
+        try:
+            plot_greece_locator_map(coords_df.dropna(subset=["X","Y"]), OUT_FIGS / "fig0b_greece_locator_map.tiff", pad_frac=0.08)
+        except Exception as e:
+            print("[WARN] locator map failed:", e)
+    except Exception as e:
+        print("[WARN] Study-area map failed:", e)
+
+    # 8) SGI monthly time series for each well
+    def fill_sgi_severity_background(ax, max_abs=5.0, step=0.5, alpha_step=0.05,
+                                     dry_color="tomato", wet_color="cornflowerblue"):
+        dry_rgb = mcolors.to_rgb(dry_color); wet_rgb = mcolors.to_rgb(wet_color)
+        n_steps = int(np.ceil(max_abs / step))
+        for i in range(n_steps):
+            y0 = -(i + 1) * step; y1 = -i * step; alpha = float(np.clip((i + 1) * alpha_step, 0.0, 0.6))
+            ax.axhspan(y0, y1, facecolor=dry_rgb, alpha=alpha, zorder=0)
+        for i in range(n_steps):
+            y0 = i * step; y1 = (i + 1) * step; alpha = float(np.clip((i + 1) * alpha_step, 0.0, 0.6))
+            ax.axhspan(y0, y1, facecolor=wet_rgb, alpha=alpha, zorder=0)
+
+    for well in sgi.columns:
+        s = sgi[well]
+        data_min = np.nanmin([s.min(), -1.0, 0.0]); data_max = np.nanmax([s.max(), -1.0, 0.0])
+        span = data_max - data_min; pad = 0.1 * span if (np.isfinite(span) and span > 0) else 0.5
+        ymin_raw = data_min - pad; ymax_raw = data_max + pad
+        ymin = _round_to_step(ymin_raw, step=0.5, how="floor")
+        ymax = _round_to_step(ymax_raw, step=0.5, how="ceil")
+        if not (np.isfinite(ymin) and np.isfinite(ymax)) or (ymax <= ymin):
+            ymin, ymax = -2.5, 2.5
+        max_abs = _round_to_step(max(abs(ymin), abs(ymax)), step=0.5, how="ceil")
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        fill_sgi_severity_background(ax, max_abs=max_abs, step=0.5, alpha_step=0.05)
+        ax.plot(s.index, s.values, label="SGI", color="cornflowerblue", linewidth=3, zorder=1)
+        ax.axhline(0, color="gray", linestyle="--", linewidth=1, zorder=1)
+        ax.axhline(-1.0, color="red", linestyle="--", linewidth=1.2, label="Drought threshold (SGI<-1)", zorder=1)
+        drought_mask = s < -1.0
+        ax.scatter(s.index[drought_mask], s.values[drought_mask], facecolors="lightcoral",
+            edgecolors="firebrick", linewidths=0.6, s=30, label="Drought", zorder=2)
+        ax.set_ylim(ymin, ymax); ax.set_ylabel("SGI (Standardized Groundwater Level)")
+        ax.grid(alpha=0.3); ax.legend(title=f"Well: {well}")
+        save_tiff(OUT_SGI_SERIES / f"SGI_series_{well}.tiff")
+
+    # 9) Interpolated annual groundwater level maps (IDW)
+    try:
+        annual_maps_out = Path("./out_annual_gw_maps_EN"); annual_maps_out.mkdir(parents=True, exist_ok=True)
+
+        data_min = float(np.nanmin(annual.values)) if np.any(np.isfinite(annual.values)) else np.nan
+        data_max = float(np.nanmax(annual.values)) if np.any(np.isfinite(annual.values)) else np.nan
+        if np.isfinite(data_min) and np.isfinite(data_max):
+            absmax = float(max(abs(data_min), abs(data_max)))
+            VMIN, VMAX = -absmax, absmax
+            if absmax == 0:
+                VMIN, VMAX = -1.0, 1.0
+        else:
+            VMIN, VMAX = -1.0, 1.0
+
+        cxmin, cxmax = float(coords_df["X"].min()), float(coords_df["X"].max())
+        cymin, cymax = float(coords_df["Y"].min()), float(coords_df["Y"].max())
+
+        pdx = 0.10 * (cxmax - cxmin) if np.isfinite(cxmax - cxmin) else 0.0
+        pdy = 0.10 * (cymax - cymin) if np.isfinite(cymax - cymin) else 0.0
+        gxmin, gxmax = cxmin - pdx, cxmax + pdx
+        gymin, gymax = cymin - pdy, cymax + pdy
+
+        for y in annual.index.astype(int):
+            vals = annual.loc[y].reindex(coords_df["Well"]).values.astype(float)
+
+            Xi, Yi, Zi, extent = _idw_grid(
+                coords_df["X"].values, coords_df["Y"].values, vals,
+                xmin=gxmin, xmax=gxmax, ymin=gymin, ymax=gymax,
+                nx=250, power=2
+            )
+
+            fig, ax = plt.subplots(figsize=(6.8, 5.4))
+            im = ax.imshow(
+                Zi, origin="lower", extent=extent, cmap="RdBu", vmin=VMIN, vmax=VMAX, aspect="auto"
+            )
+            sc = ax.scatter(
+                coords_df["X"], coords_df["Y"], c=vals, cmap="RdBu",
+                vmin=VMIN, vmax=VMAX, s=35, edgecolor="black"
+            )
+            for i, row in coords_df.iterrows():
+                ax.annotate(row["Well"], (row["X"], row["Y"]),
+                            xytext=(3, 3), textcoords="offset points", fontsize=7)
+
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label("Annual mean groundwater depth (m)")
+
+            ax.set_title(f"Interpolated annual groundwater depth — {y}")
+            ax.set_xlabel("Longitude/X"); ax.set_ylabel("Latitude/Y")
+            plt.grid(alpha=0.2)
+
+            save_tiff(annual_maps_out / f"annual_depth_map_{y}.tiff")
+    except Exception as e:
+        print("[WARN] Annual IDW maps failed:", e)
+
+# === IDW grid core ===
+def _idw_grid(x, y, z, xmin, xmax, ymin, ymax, nx=300, power=2, eps=1e-12):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    z = np.asarray(z, dtype=float)
+    xr = xmax - xmin; yr = ymax - ymin
+    nx = int(nx); ny = max(2, int(round(nx * (yr / xr)))) if xr > 0 else nx
+    xi = np.linspace(xmin, xmax, nx); yi = np.linspace(ymin, ymax, ny)
+    Xi, Yi = np.meshgrid(xi, yi)
+    dx = Xi[None, :, :] - x[:, None, None]; dy = Yi[None, :, :] - y[:, None, None]
+    dist = np.hypot(dx, dy) + eps; w = 1.0 / (dist ** power)
+    valid = np.isfinite(z)
+    if valid.sum() < 3: return Xi, Yi, np.full_like(Xi, np.nan), [xmin, xmax, ymin, ymax]
+    w = w[valid]; zv = z[valid][:, None, None]
+    Zi = np.nansum(w * zv, axis=0) / np.nansum(w, axis=0)
+    return Xi, Yi, Zi, [xmin, xmax, ymin, ymax]
+
+if __name__ == "__main__":
+    main()
 
